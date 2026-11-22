@@ -73,6 +73,13 @@ function buildSystemPrompt(memberId: string): string {
 2. 질의가 모호하거나 추가 정보가 필요하면 request_clarification을 호출하고 분석을 중단하세요
 3. ERP Git / DB 도구로 근거를 찾아 답변하세요
 
+[탐색 효율 규칙 — 반드시 준수]
+- 병렬 호출: 서로 독립적인 검색은 한 턴에 여러 도구를 동시에 호출하세요 (예: searchCode 두 개를 한 번에 호출)
+- 중복 금지: 이미 readFileRange로 읽은 파일은 절대 다시 읽지 마세요. 대화 기록에 내용이 있으면 그대로 재사용하세요
+- 범위 확보: readFileRange 호출 시 lineStart~lineEnd를 충분히 넓게 잡아 한 번에 필요한 로직을 모두 읽으세요
+- 추적 순서: ERP 로직은 JSP → Controller → Service → Mapper XML 순서로 단계별 추적하세요
+- 탐색 한도: 최대 ${env.claudeMaxTurns}턴. 각 턴에서 가능한 한 많은 정보를 병렬로 수집하세요
+
 [도구 사용 원칙]
 - 코드 분석: searchCode 또는 listFiles 로 탐색 → readFileRange 로 내용 확인
 - 데이터 분석: describeTable → executeQuery 순서로 진행
@@ -165,6 +172,10 @@ export class AgentRunner {
     let filesRead = 0;
     let dbQueries = 0;
     let totalTokens = 0;
+    /** 현재까지 완료된 LLM 턴 수 (message_start 기준) */
+    let turnCount = 0;
+    /** 현재까지 완료된 도구 호출 횟수 */
+    let toolCallCount = 0;
 
     // ── 커스텀 인프로세스 MCP 도구 ───────────────────────
     const setQueryTypeTool = tool(
@@ -229,6 +240,10 @@ export class AgentRunner {
       const toolName = inp.tool_name ?? "";
       const toolInput = inp.tool_input ?? {};
       const elapsed = Date.now() - startMs;
+      toolCallCount++;
+
+      // "턴 N/MAX · 도구 K회" 접미사 — 모든 trace에 공통으로 붙입니다
+      const turnSuffix = `턴 ${turnCount}/${env.claudeMaxTurns} · 도구 ${toolCallCount}회`;
 
       if (toolName.includes("readFileRange") || toolName.includes("read_file_range")) {
         filesRead++;
@@ -236,7 +251,7 @@ export class AgentRunner {
         const lineStart = Number(toolInput.lineStart ?? toolInput.line_start ?? 0);
         const locator = lineStart > 0 ? `${path}:${lineStart}` : path;
         if (locator) references.push({ locator, description: `파일 읽기: ${path}` });
-        push({ event: "trace", data: { label: "저장소 탐색", detail: path || undefined, elapsedMs: elapsed } });
+        push({ event: "trace", data: { label: `저장소 탐색 (${turnSuffix})`, detail: path || undefined, elapsedMs: elapsed } });
       } else if (
         toolName.includes("searchCode") ||
         toolName.includes("search_code") ||
@@ -244,21 +259,21 @@ export class AgentRunner {
         toolName.includes("list_files")
       ) {
         const pattern = String(toolInput.pattern ?? toolInput.query ?? "");
-        push({ event: "trace", data: { label: "저장소 탐색", detail: pattern || undefined, elapsedMs: elapsed } });
+        push({ event: "trace", data: { label: `저장소 탐색 (${turnSuffix})`, detail: pattern || undefined, elapsedMs: elapsed } });
       }
 
       if (toolName.includes("executeQuery") || toolName.includes("execute_query")) {
         dbQueries++;
         const table = String(toolInput.table ?? "");
         if (table) references.push({ locator: table, description: `DB 조회: ${table}` });
-        push({ event: "trace", data: { label: "DB 조회", detail: table || undefined, elapsedMs: elapsed } });
+        push({ event: "trace", data: { label: `DB 조회 (${turnSuffix})`, detail: table || undefined, elapsedMs: elapsed } });
       } else if (
         toolName.includes("describeTable") ||
         toolName.includes("describe_table") ||
         toolName.includes("listTables") ||
         toolName.includes("list_tables")
       ) {
-        push({ event: "trace", data: { label: "DB 조회", elapsedMs: elapsed } });
+        push({ event: "trace", data: { label: `DB 조회 (${turnSuffix})`, elapsedMs: elapsed } });
       }
 
       return {};
@@ -314,9 +329,46 @@ export class AgentRunner {
     const runAgent = async () => {
       let agentGen: ReturnType<typeof query> | null = null;
       let agentSessionId: string | undefined;
-      let finalAnswer = "";
-      // content_block_delta 이벤트로 토큰을 이미 스트리밍했는지 추적
-      let hasStreamedTokens = false;
+      let totalTokens = 0;
+
+      // ── 턴(Turn) 추적 상태 ───────────────────────────────
+      // 아젠틱 루프는 여러 LLM 턴으로 구성됩니다:
+      //   Turn 1: 계획 텍스트 + 도구 호출 선언
+      //   Turn 2~N-1: 추가 도구 호출 (중간 턴)
+      //   Turn N: 최종 답변 (last turn)
+      //
+      // message_start 이벤트가 새 턴 시작을 알립니다.
+      // content_block_delta / assistant 이벤트는 현재 턴에 귀속됩니다.
+      //
+      // 중간 턴 텍스트는 trace 이벤트로 emit하고,
+      // 마지막 턴 텍스트만 token 이벤트로 스트리밍 + done.answer에 담습니다.
+
+      /** 현재 활성 턴의 message ID (message_start에서 획득) */
+      let currentMsgId: string | null = null;
+      /** 현재 턴에 누적된 텍스트 */
+      let currentTurnText = "";
+      /** content_block_delta로 이미 스트리밍한 message ID 집합 (assistant 블록 중복 방지) */
+      const streamedMsgIds = new Set<string>();
+
+      /**
+       * 현재 턴을 중간 턴으로 확정합니다.
+       * @param elapsedMs - 경과 시간
+       * @param turnNum   - 완료되는 턴 번호 (trace 레이블에 표시)
+       */
+      const finalizeIntermediateTurn = (elapsedMs: number, turnNum: number) => {
+        if (currentMsgId && currentTurnText.trim()) {
+          push({
+            event: "trace",
+            data: {
+              label: `LLM 계획 (턴 ${turnNum}/${env.claudeMaxTurns})`,
+              detail: currentTurnText.replace(/\n+/g, " ").substring(0, 120),
+              elapsedMs,
+            },
+          });
+        }
+        currentMsgId = null;
+        currentTurnText = "";
+      };
 
       try {
         const queryOptions: Parameters<typeof query>[0] = {
@@ -338,7 +390,8 @@ export class AgentRunner {
               "mcp__erp-db__describeTable",
               "mcp__erp-db__executeQuery",
             ],
-            maxTurns: env.claudeMaxToolLoops + 1,
+            maxTurns: env.claudeMaxTurns,
+            includePartialMessages: true,
             hooks: {
               PostToolUse: [{ matcher: ".*", hooks: [trackToolUse] }],
             },
@@ -352,56 +405,110 @@ export class AgentRunner {
         // 취소 지원: agentGen을 sessionStore에 등록
         this.sessionStore.registerRequest(req.requestId, agentGen as AsyncGenerator<unknown>);
 
+        let maxTurnsHit = false; // error_max_turns 감지 플래그
+
         for await (const message of agentGen) {
           if (message && typeof message === "object") {
             const msg = message as Record<string, unknown>;
+
+            // ── [DUMP] SDK 메시지 덤프 (턴 경계 확인용) ──────
+            // msg.type과 msg.event?.type을 함께 출력합니다.
+            // stream_event 하위 이벤트 타입까지 확인할 수 있습니다.
+            const evtObj = msg.event as Record<string, unknown> | undefined;
+            console.log(
+              `[sdk-msg] type=${String(msg.type ?? "-")}` +
+              ` event.type=${String(evtObj?.type ?? "-")}` +
+              ` t=${Date.now() - startMs}ms`
+            );
 
             // ── Agent SDK 세션 ID 캡처 (resume에 사용) ────────
             if (msg.type === "system" && msg.subtype === "init" && msg.session_id) {
               agentSessionId = String(msg.session_id);
             }
 
-            // ── [1순위] content_block_delta: 토큰 단위 실시간 스트리밍 ──
-            // Agent SDK가 Claude API의 스트리밍 이벤트를 그대로 노출할 때 도달합니다.
-            if (msg.type === "content_block_delta") {
-              const delta = msg.delta as Record<string, unknown> | undefined;
-              if (delta?.type === "text_delta" && typeof delta.text === "string" && delta.text) {
-                finalAnswer += delta.text;
-                hasStreamedTokens = true;
-                push({ event: "token", data: { text: delta.text } });
+            // ── stream_event: 실시간 스트리밍 ────────────────
+            // includePartialMessages: true 설정 시 SDK가 BetaRawMessageStreamEvent를
+            // SDKPartialAssistantMessage.event에 담아 stream_event 타입으로 emit합니다.
+            //
+            // 이벤트 경로:
+            //   msg.type === "stream_event"
+            //     → msg.event.type === "message_start"   : 새 턴 시작, message ID 획득
+            //     → msg.event.type === "content_block_delta"
+            //         → msg.event.delta.type === "text_delta" : 토큰 emit
+            if (msg.type === "stream_event" && evtObj) {
+
+              // 새 턴 시작 (message_start)
+              if (evtObj.type === "message_start") {
+                const newMsgId = String(
+                  (evtObj.message as Record<string, unknown> | undefined)?.id ?? ""
+                );
+                if (newMsgId && newMsgId !== currentMsgId) {
+                  if (currentMsgId) {
+                    // 직전 턴을 중간 턴으로 확정 → trace emit (현재 turnCount = 직전 턴 번호)
+                    finalizeIntermediateTurn(Date.now() - startMs, turnCount);
+                  }
+                  turnCount++;   // 새 턴 번호 증가
+                  currentMsgId = newMsgId;
+                  currentTurnText = "";
+                  // 이 message ID는 stream_event로 처리됨 → assistant 블록 중복 방지
+                  streamedMsgIds.add(newMsgId);
+                }
+              }
+
+              // 토큰 스트리밍 (content_block_delta → text_delta)
+              if (evtObj.type === "content_block_delta") {
+                const delta = evtObj.delta as Record<string, unknown> | undefined;
+                if (delta?.type === "text_delta" && typeof delta.text === "string" && delta.text) {
+                  currentTurnText += delta.text;
+                  push({ event: "token", data: { text: delta.text } });
+                }
               }
             }
 
-            // ── [2순위] assistant 완성 메시지 fallback ────────
-            // content_block_delta가 없는 SDK 버전에서는 완성된 메시지 블록을 통째로 emit합니다.
-            if (msg.type === "assistant" && !hasStreamedTokens) {
+            // ── assistant 완성 메시지 ─────────────────────────
+            // stream_event로 이미 스트리밍된 msgId는 토큰을 다시 emit하지 않습니다.
+            // includePartialMessages 없는 환경에서만 토큰을 emit하는 fallback 경로입니다.
+            if (msg.type === "assistant") {
               const assistantMsg = msg.message as
-                | { content?: Array<{ type: string; text?: string }> }
+                | { id?: string; content?: Array<{ type: string; text?: string }> }
                 | undefined;
-              if (assistantMsg?.content) {
-                for (const block of assistantMsg.content) {
+              const msgId = assistantMsg?.id ?? "";
+
+              if (streamedMsgIds.has(msgId)) {
+                // stream_event로 이미 처리 완료 → 중복 skip
+              } else {
+                // fallback: stream_event 없이 완성 메시지만 도착하는 환경
+                if (msgId && currentMsgId && currentMsgId !== msgId) {
+                  finalizeIntermediateTurn(Date.now() - startMs, turnCount);
+                }
+                if (msgId) currentMsgId = msgId;
+
+                for (const block of assistantMsg?.content ?? []) {
                   if (block.type === "text" && typeof block.text === "string" && block.text) {
-                    finalAnswer += block.text;
-                    hasStreamedTokens = true;
+                    currentTurnText += block.text;
                     push({ event: "token", data: { text: block.text } });
                   }
                 }
+                if (msgId) streamedMsgIds.add(msgId);
               }
             }
 
-            // ── [3순위] result 필드 fallback ─────────────────
-            // 위 두 경로 모두에서 텍스트를 얻지 못했을 때만 사용합니다.
-            if ("result" in msg) {
-              if (!hasStreamedTokens) {
-                finalAnswer = String(msg.result);
-                if (finalAnswer) {
-                  hasStreamedTokens = true;
-                  push({ event: "token", data: { text: finalAnswer } });
-                }
-              } else if (!finalAnswer) {
-                // 토큰은 스트리밍됐지만 누락된 경우 보정
-                finalAnswer = String(msg.result);
+            // ── result: 에이전트 루프 종료 ───────────────────
+            // error_max_turns → 재시도 플래그만 세우고 루프 탈출 (에러 throw 안 함)
+            // 그 외 비성공 subtype → 즉시 에러
+            if (msg.type === "result") {
+              const subtype = String(msg.subtype ?? "");
+              if (subtype === "error_max_turns") {
+                maxTurnsHit = true;
+                break; // 루프 탈출 → 아래 재시도 블록으로 진행
+              } else if (subtype !== "success") {
+                const errDetail =
+                  (msg.error as Record<string, unknown> | undefined)?.message ??
+                  msg.result ??
+                  `Agent 비정상 종료: ${subtype}`;
+                throw new Error(String(errDetail));
               }
+              // success: currentTurnText = 마지막 턴 텍스트 → done.answer
             }
 
             // ── 토큰 집계 ─────────────────────────────────────
@@ -411,6 +518,105 @@ export class AgentRunner {
             }
           }
         }
+
+        // ── error_max_turns 재시도 ────────────────────────
+        // 최대 턴 소진 시: 저장된 agentSessionId로 resume하여
+        // 도구 없이 maxTurns:1로 한 번 더 호출 → 지금까지 확인한 내용만으로 답변 생성
+        if (maxTurnsHit) {
+          if (!agentSessionId) {
+            throw new Error(
+              `탐색 한도(${env.claudeMaxTurns}턴) 초과: agent 세션 ID 없어 재시도 불가`
+            );
+          }
+
+          push({
+            event: "trace",
+            data: {
+              label: `탐색 한도 도달 (${env.claudeMaxTurns}턴 소진)`,
+              detail: "지금까지 확인한 내용으로 최종 답변 생성 중…",
+              elapsedMs: Date.now() - startMs,
+            },
+          });
+
+          // 재시도용 턴 상태 초기화 (토큰 누적 초기화)
+          currentMsgId = null;
+          currentTurnText = "";
+
+          const retryGen = query({
+            prompt:
+              "지금까지 도구로 확인한 내용만을 토대로 추가 도구 호출 없이 최종 답변을 작성하세요.",
+            options: {
+              systemPrompt: buildSystemPrompt(req.memberId),
+              model: env.claudeModel,
+              mcpServers: { "musing-core": customServer },
+              allowedTools: [], // 도구 호출 불허
+              maxTurns: 1,
+              includePartialMessages: true,
+              resume: agentSessionId,
+            },
+          });
+
+          try {
+            for await (const retryMsg of retryGen) {
+              if (retryMsg && typeof retryMsg === "object") {
+                const rm = retryMsg as Record<string, unknown>;
+                const revt = rm.event as Record<string, unknown> | undefined;
+
+                // 재시도 토큰 스트리밍
+                if (rm.type === "stream_event" && revt?.type === "content_block_delta") {
+                  const delta = revt.delta as Record<string, unknown> | undefined;
+                  if (delta?.type === "text_delta" && typeof delta.text === "string" && delta.text) {
+                    currentTurnText += delta.text;
+                    push({ event: "token", data: { text: delta.text } });
+                  }
+                }
+
+                // assistant fallback (includePartialMessages 미지원 환경)
+                if (rm.type === "assistant") {
+                  const am = rm.message as
+                    | { id?: string; content?: Array<{ type: string; text?: string }> }
+                    | undefined;
+                  const amid = am?.id ?? "";
+                  if (!streamedMsgIds.has(amid)) {
+                    for (const block of am?.content ?? []) {
+                      if (block.type === "text" && typeof block.text === "string" && block.text) {
+                        currentTurnText += block.text;
+                        push({ event: "token", data: { text: block.text } });
+                      }
+                    }
+                    if (amid) streamedMsgIds.add(amid);
+                  }
+                }
+
+                // 재시도 result 체크 (성공이 아니면 에러)
+                if (rm.type === "result" && String(rm.subtype ?? "") !== "success") {
+                  throw new Error(`재시도 실패: ${String(rm.subtype ?? "unknown")}`);
+                }
+
+                if (rm.usage) {
+                  const u = rm.usage as { input_tokens?: number; output_tokens?: number };
+                  totalTokens += (u.input_tokens ?? 0) + (u.output_tokens ?? 0);
+                }
+              }
+            }
+
+            // 안내 문구를 답변 앞에 붙입니다
+            const notice = "탐색 한도에 도달해 확인된 범위까지만 답변합니다.\n\n";
+            currentTurnText = notice + currentTurnText.trim();
+
+          } catch (retryErr) {
+            throw new Error(
+              `탐색 한도(${env.claudeMaxTurns}턴) 초과 후 최종 답변 생성 실패: ` +
+              `${retryErr instanceof Error ? retryErr.message : String(retryErr)}`
+            );
+          }
+        }
+
+        // result 없이 generator가 끝난 경우에도 최선을 다해 답변을 구성합니다.
+        // (일부 SDK 버전은 result를 emit하지 않을 수 있음)
+
+        // 마지막 턴 텍스트 = done.answer
+        const finalAnswer = currentTurnText.trim();
 
         // 세션 agentSessionId 저장 (다음 turn에 resume용)
         if (agentSessionId) {
